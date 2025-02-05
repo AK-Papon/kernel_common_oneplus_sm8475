@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 VERSION = 5
 PATCHLEVEL = 10
-SUBLEVEL = 209
+SUBLEVEL = 233
 EXTRAVERSION =
 NAME = Dare mighty things
 
@@ -1387,13 +1387,11 @@ endif
 # needs to be updated, so this check is forced on all builds
 
 uts_len := 64
-#ifdef OPLUS_FEATURE_BUILD
-#ifneq (,$(BUILD_NUMBER))
-#	UTS_RELEASE=$(KERNELRELEASE)-ab$(BUILD_NUMBER)
-#else
+ifneq (,$(BUILD_NUMBER))
+	UTS_RELEASE=$(KERNELRELEASE)-ab$(BUILD_NUMBER)
+else
 	UTS_RELEASE=$(KERNELRELEASE)
-#endif
-#endif OPLUS_FEATURE_BUILD
+endif
 define filechk_utsrelease.h
 	if [ `echo -n "$(UTS_RELEASE)" | wc -c ` -gt $(uts_len) ]; then \
 		echo '"$(UTS_RELEASE)" exceeds $(uts_len) characters' >&2;    \
@@ -1462,7 +1460,9 @@ kselftest-merge:
 # Devicetree files
 
 ifneq ($(wildcard $(srctree)/arch/$(SRCARCH)/boot/dts/),)
-dtstree := arch/$(SRCARCH)/boot/dts
+# ANDROID: allow this to be overridden by the build environment. This allows
+# one to compile a device tree that is located out-of-tree.
+dtstree ?= arch/$(SRCARCH)/boot/dts
 endif
 
 ifneq ($(dtstree),)
@@ -1931,7 +1931,9 @@ $(clean-dirs):
 
 clean: $(clean-dirs)
 	$(call cmd,rmfiles)
-	@find $(if $(KBUILD_EXTMOD), $(KBUILD_EXTMOD), .) $(RCS_FIND_IGNORE) \
+	@find $(if $(KBUILD_EXTMOD), $(KBUILD_EXTMOD), .) \
+		$(if $(filter-out arch/$(SRCARCH)/boot/dts, $(dtstree)), $(dtstree)) \
+		$(RCS_FIND_IGNORE) \
 		\( -name '*.[aios]' -o -name '*.ko' -o -name '.*.cmd' \
 		-o -name '*.ko.*' \
 		-o -name '*.dtb' -o -name '*.dtb.S' -o -name '*.dt.yaml' \

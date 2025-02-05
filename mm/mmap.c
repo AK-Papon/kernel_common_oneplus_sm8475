@@ -23,6 +23,7 @@
 #include <linux/init.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/pgsize_migration.h>
 #include <linux/personality.h>
 #include <linux/security.h>
 #include <linux/hugetlb.h>
@@ -198,8 +199,7 @@ static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
 	struct vm_area_struct *next = vma->vm_next;
 
 	might_sleep();
-	if (vma->vm_ops && vma->vm_ops->close)
-		vma->vm_ops->close(vma);
+	vma_close(vma);
 	put_vma(vma);
 	return next;
 }
@@ -880,11 +880,7 @@ int __vma_adjust(struct vm_area_struct *vma, unsigned long start,
 		}
 	}
 again:
-#ifdef CONFIG_CONT_PTE_HUGEPAGE
-	vma_adjust_cont_pte_trans_huge(orig_vma, start, end, adjust_next);
-#else
 	vma_adjust_trans_huge(orig_vma, start, end, adjust_next);
-#endif
 
 	if (file) {
 		mapping = file->f_mapping;
@@ -1106,6 +1102,8 @@ static inline int is_mergeable_vma(struct vm_area_struct *vma,
 	if (!is_mergeable_vm_userfaultfd_ctx(vma, vm_userfaultfd_ctx))
 		return 0;
 	if (vma_get_anon_name(vma) != anon_name)
+		return 0;
+	if (!is_mergable_pad_vma(vma, vm_flags))
 		return 0;
 	return 1;
 }
@@ -1539,7 +1537,7 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	 * to. we assume access permissions have been handled by the open
 	 * of the memory object, so we don't do any here.
 	 */
-	vm_flags = calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(flags) |
+	vm_flags = calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(file, flags) |
 			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
 
 	if (flags & MAP_LOCKED)
@@ -1555,16 +1553,6 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 
 		if (!file_mmap_ok(file, inode, pgoff, len))
 			return -EOVERFLOW;
-
-#ifdef CONFIG_CONT_PTE_HUGEPAGE
-		/* jar is first mapped as R+W, then W is removed. but actually Android has
-		 * never written it. ignore WRITE and make jar eligible for hugepages.
-		 * Note: Ideally, we should fix it in Android.
-		 */
-		if (inode->may_cont_pte == JAR_HUGE &&
-		    CONFIG_CONT_PTE_FILE_HUGEPAGE_DISABLE != 1)
-			vm_flags &= ~VM_WRITE;
-#endif
 
 		flags_mask = LEGACY_MAP_MASK | file->f_op->mmap_supported_flags;
 
@@ -1807,7 +1795,7 @@ static inline int accountable_mapping(struct file *file, vm_flags_t vm_flags)
 	return (vm_flags & (VM_NORESERVE | VM_SHARED | VM_WRITE)) == VM_WRITE;
 }
 
-unsigned long mmap_region(struct file *file, unsigned long addr,
+static unsigned long __mmap_region(struct file *file, unsigned long addr,
 		unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
 		struct list_head *uf)
 {
@@ -1876,11 +1864,6 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 			if (error)
 				goto free_vma;
 		}
-		if (vm_flags & VM_SHARED) {
-			error = mapping_map_writable(file->f_mapping);
-			if (error)
-				goto allow_write_and_free_vma;
-		}
 
 		/* ->mmap() can change vma->vm_file, but must guarantee that
 		 * vma_link() below can deny write-access if VM_DENYWRITE is set
@@ -1888,9 +1871,9 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 		 * new file must not have been exposed to user-space, yet.
 		 */
 		vma->vm_file = get_file(file);
-		error = call_mmap(file, vma);
+		error = mmap_file(file, vma);
 		if (error)
-			goto unmap_and_free_vma;
+			goto unmap_and_free_file_vma;
 
 		/* Can addr have changed??
 		 *
@@ -1901,9 +1884,17 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 		 */
 		WARN_ON_ONCE(addr != vma->vm_start);
 
+		/*
+		 * Drivers should not permit writability when previously it was
+		 * disallowed.
+		 */
+		VM_WARN_ON_ONCE(vm_flags != vma->vm_flags &&
+				!(vm_flags & VM_MAYWRITE) &&
+				(vma->vm_flags & VM_MAYWRITE));
+
 		addr = vma->vm_start;
 
-		/* If vm_flags changed after call_mmap(), we should try merge vma again
+		/* If vm_flags changed after mmap_file(), we should try merge vma again
 		 * as we may succeed this time.
 		 */
 		if (unlikely(vm_flags != vma->vm_flags && prev)) {
@@ -1933,21 +1924,14 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 		vma_set_anonymous(vma);
 	}
 
-	/* Allow architectures to sanity-check the vm_flags */
-	if (!arch_validate_flags(vma->vm_flags)) {
-		error = -EINVAL;
-		if (file)
-			goto close_and_free_vma;
-		else
-			goto free_vma;
-	}
+#ifdef CONFIG_SPARC64
+	/* TODO: Fix SPARC ADI! */
+	WARN_ON_ONCE(!arch_validate_flags(vm_flags));
+#endif
 
 	vma_link(mm, vma, prev, rb_link, rb_parent);
-	/* Once vma denies write, undo our temporary denial count */
 	if (file) {
 unmap_writable:
-		if (vm_flags & VM_SHARED)
-			mapping_unmap_writable(file->f_mapping);
 		if (vm_flags & VM_DENYWRITE)
 			allow_write_access(file);
 	}
@@ -1986,18 +1970,12 @@ out:
 
 	return addr;
 
-close_and_free_vma:
-	if (vma->vm_ops && vma->vm_ops->close)
-		vma->vm_ops->close(vma);
-unmap_and_free_vma:
+unmap_and_free_file_vma:
 	vma->vm_file = NULL;
 	fput(file);
 
 	/* Undo any partial mapping done by a device driver. */
 	unmap_region(mm, vma, prev, vma->vm_start, vma->vm_end);
-	if (vm_flags & VM_SHARED)
-		mapping_unmap_writable(file->f_mapping);
-allow_write_and_free_vma:
 	if (vm_flags & VM_DENYWRITE)
 		allow_write_access(file);
 free_vma:
@@ -2278,12 +2256,8 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
 	info.length = len;
 	info.low_limit = mm->mmap_base;
 	info.high_limit = mmap_end;
-	info.align_offset = 0;
-#ifndef CONFIG_CONT_PTE_HUGEPAGE
 	info.align_mask = 0;
-#else
-	handle_chp_get_unmapped_area(&info, filp, pgoff);
-#endif
+	info.align_offset = 0;
 	return vm_unmapped_area(&info);
 }
 #endif
@@ -2310,7 +2284,7 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
 	if (flags & MAP_FIXED)
 		return addr;
 
-	/* requesting a specific address, and also read xxx*/
+	/* requesting a specific address */
 	if (addr) {
 		addr = PAGE_ALIGN(addr);
 		vma = find_vma_prev(mm, addr, &prev);
@@ -2324,12 +2298,8 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
 	info.length = len;
 	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
 	info.high_limit = arch_get_mmap_base(addr, mm->mmap_base);
-	info.align_offset = 0;
-#ifndef CONFIG_CONT_PTE_HUGEPAGE
 	info.align_mask = 0;
-#else
-	handle_chp_get_unmapped_area(&info, filp, pgoff);
-#endif
+	info.align_offset = 0;
 	trace_android_vh_exclude_reserved_zone(mm, &info);
 	addr = vm_unmapped_area(&info);
 
@@ -2924,12 +2894,13 @@ int __split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 		err = vma_adjust(vma, vma->vm_start, addr, vma->vm_pgoff, new);
 
 	/* Success. */
-	if (!err)
+	if (!err) {
+		split_pad_vma(vma, new, addr, new_below);
 		return 0;
+	}
 
 	/* Clean everything up if vma_adjust failed. */
-	if (new->vm_ops && new->vm_ops->close)
-		new->vm_ops->close(new);
+	vma_close(new);
 	if (new->vm_file)
 		fput(new->vm_file);
 	unlink_anon_vmas(new);
@@ -2949,14 +2920,6 @@ int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 {
 	if (mm->map_count >= sysctl_max_map_count)
 		return -ENOMEM;
-
-#ifdef CONFIG_CONT_PTE_HUGEPAGE
-#if CONFIG_CHP_ABMORMAL_PTES_DEBUG
-	if (vma_is_chp_anonymous(vma) && !IS_ALIGNED(addr, HPAGE_CONT_PTE_SIZE)) {
-		{volatile bool __maybe_unused x = commit_chp_abnormal_ptes_record(DOUBLE_MAP_REASON_SPLIT_VMA);}
-	}
-#endif
-#endif
 
 	return __split_vma(mm, vma, addr, new_below);
 }
@@ -3082,6 +3045,36 @@ int do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
 	return __do_munmap(mm, start, len, uf, false);
 }
 
+unsigned long mmap_region(struct file *file, unsigned long addr,
+			  unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
+			  struct list_head *uf)
+{
+	unsigned long ret;
+	bool writable_file_mapping = false;
+
+	/* Allow architectures to sanity-check the vm_flags. */
+	if (!arch_validate_flags(vm_flags))
+		return -EINVAL;
+
+	/* Map writable and ensure this isn't a sealed memfd. */
+	if (file && (vm_flags & VM_SHARED)) {
+		int error = mapping_map_writable(file->f_mapping);
+
+		if (error)
+			return error;
+		writable_file_mapping = true;
+	}
+
+	ret = __mmap_region(file, addr, len, vm_flags, pgoff, uf);
+
+	/* Clear our write mapping regardless of error. */
+	if (writable_file_mapping)
+		mapping_unmap_writable(file->f_mapping);
+
+	validate_mm(current->mm);
+	return ret;
+}
+
 static int __vm_munmap(unsigned long start, size_t len, bool downgrade)
 {
 	int ret;
@@ -3199,11 +3192,7 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 			 * Split pmd and munlock page on the border
 			 * of the range.
 			 */
-#ifdef CONFIG_CONT_PTE_HUGEPAGE
-			vma_adjust_cont_pte_trans_huge(tmp, start, start + size, 0);
-#else
 			vma_adjust_trans_huge(tmp, start, start + size, 0);
-#endif
 
 			munlock_vma_pages_range(tmp,
 					max(tmp->vm_start, start),
